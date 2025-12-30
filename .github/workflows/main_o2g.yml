@@ -28,7 +28,7 @@ jobs:
         working-directory: ${{ github.workspace }}
 
       - name: dotnet publish
-        run: dotnet publish Omron2Garmin.Web/Omron2Garmin.Web.csproj -c Release -o myapp
+        run: dotnet publish Omron2Garmin.Web/Omron2Garmin.Web.csproj -c Release -o myapp -self-contained false
         working-directory: ${{ github.workspace }}
 
       - name: Upload artifact for deployment job
