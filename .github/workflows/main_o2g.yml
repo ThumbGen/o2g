@@ -47,11 +47,16 @@ jobs:
         with:
           name: .net-app
 
+      - name: List files after artifact download
+        run: |
+          echo "Listing current directory contents:"
+          ls -R
+
       - name: Deploy to Azure Web App
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'o2g'
           slot-name: 'Production'
-          package: myapp/**
+          package: myapp
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_CDD96D08634E496E94C1C2096DBE5A47 }}
