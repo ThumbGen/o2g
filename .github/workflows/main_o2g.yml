@@ -25,15 +25,17 @@ jobs:
 
       - name: Build with dotnet
         run: dotnet build Omron2Garmin.Web/Omron2Garmin.Web.csproj --configuration Release
+        working-directory: ${{ github.workspace }}
 
       - name: dotnet publish
-        run: dotnet publish Omron2Garmin.Web/Omron2Garmin.Web.csproj -c Release -o ./myapp
+        run: dotnet publish Omron2Garmin.Web/Omron2Garmin.Web.csproj -c Release -o myapp
+        working-directory: ${{ github.workspace }}
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
           name: .net-app
-          path: ./myapp
+          path: myapp
 
   deploy:
     runs-on: windows-latest
@@ -51,5 +53,5 @@ jobs:
         with:
           app-name: 'o2g'
           slot-name: 'Production'
-          package: ./myapp
+          package: myapp
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_CDD96D08634E496E94C1C2096DBE5A47 }}
