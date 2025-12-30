@@ -47,10 +47,10 @@ jobs:
         with:
           name: .net-app
 
-      - name: List files after artifact download
-        run: |
-          echo "Listing current directory contents:"
-          ls -R
+      # - name: List files after artifact download
+      #   run: |
+      #     echo "Listing current directory contents:"
+      #     ls -R
 
       - name: Deploy to Azure Web App
         id: deploy-to-webapp
