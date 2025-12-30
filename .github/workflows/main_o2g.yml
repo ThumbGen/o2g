@@ -58,5 +58,5 @@ jobs:
         with:
           app-name: 'o2g'
           slot-name: 'Production'
-          package: myapp
+          package: .
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_CDD96D08634E496E94C1C2096DBE5A47 }}
