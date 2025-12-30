@@ -7,7 +7,7 @@ on:
 
 env:
   AZURE_WEBAPP_NAME: 'o2g-app'  # Change this to your Azure App Service name
-  DOTNET_VERSION: '10.0.x'
+  DOTNET_VERSION: '8.0.x'
 
 jobs:
   build-and-deploy:
