@@ -1,0 +1,445 @@
+﻿@page "/"
+@using Omron2Garmin.Web.Models
+@using Omron2Garmin.Web.Services
+@inject GarminService GarminService
+@inject OmronCsvParser CsvParser
+@rendermode InteractiveServer
+@implements IDisposable
+
+<PageTitle>OMRON to Garmin Sync</PageTitle>
+
+<div class="container py-4">
+    <div class="row mb-4">
+        <div class="col">
+            <h1 class="display-5">
+                <i class="bi bi-heart-pulse me-2"></i>
+                OMRON to Garmin Connect
+            </h1>
+            <p class="lead text-muted">Upload your OMRON blood pressure CSV export to Garmin Connect</p>
+        </div>
+    </div>
+
+    @* Login Section *@
+    <div class="card mb-4">
+        <div class="card-header">
+            <h5 class="mb-0">
+                <i class="bi bi-person-circle me-2"></i>
+                Step 1: Garmin Connect Login
+            </h5>
+        </div>
+        <div class="card-body">
+            @if (GarminService.IsAuthenticated)
+            {
+                <div class="d-flex align-items-center justify-content-between">
+                    <div>
+                        <span class="badge bg-success me-2">
+                            <i class="bi bi-check-circle me-1"></i>Connected
+                        </span>
+                        <span>Logged in as <strong>@GarminService.DisplayName</strong></span>
+                    </div>
+                    <button class="btn btn-outline-secondary btn-sm" @onclick="Logout">
+                        <i class="bi bi-box-arrow-right me-1"></i>Logout
+                    </button>
+                </div>
+            }
+            else
+            {
+                <div class="row g-3">
+                    <div class="col-md-5">
+                        <label class="form-label">Email</label>
+                        <input type="email" class="form-control" @bind="email" placeholder="your@email.com" disabled="@isLoggingIn" />
+                    </div>
+                    <div class="col-md-5">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-control" @bind="password" placeholder="Password" disabled="@isLoggingIn" />
+                    </div>
+                    <div class="col-md-2 d-flex align-items-end">
+                        <button class="btn btn-primary w-100" @onclick="Login" disabled="@isLoggingIn">
+                            @if (isLoggingIn)
+                            {
+                                <span class="spinner-border spinner-border-sm me-1"></span>
+                                <span>Logging in...</span>
+                            }
+                            else
+                            {
+                                <i class="bi bi-box-arrow-in-right me-1"></i>
+                                <span>Login</span>
+                            }
+                        </button>
+                    </div>
+                </div>
+
+                @if (!string.IsNullOrEmpty(loginError))
+                {
+                    <div class="alert alert-danger mt-3 mb-0">
+                        <i class="bi bi-exclamation-triangle me-2"></i>@loginError
+                    </div>
+                }
+            }
+        </div>
+    </div>
+
+    @* Upload Section *@
+    <div class="card mb-4 @(GarminService.IsAuthenticated ? "" : "opacity-50")">
+        <div class="card-header">
+            <h5 class="mb-0">
+                <i class="bi bi-upload me-2"></i>
+                Step 2: Upload OMRON CSV
+            </h5>
+        </div>
+        <div class="card-body">
+            @if (!GarminService.IsAuthenticated)
+            {
+                <p class="text-muted mb-0">Please login to Garmin Connect first.</p>
+            }
+            else
+            {
+                <div class="mb-3">
+                    <label class="form-label">Select your OMRON Connect CSV export file</label>
+                    <InputFile class="form-control" OnChange="HandleFileSelected" accept=".csv" disabled="@isUploading" />
+                    <div class="form-text">
+                        Export your blood pressure data from the OMRON Connect app and upload the CSV file here.
+                    </div>
+                </div>
+
+                @if (parsedReadings.Count > 0 && !isUploading && syncResult == null)
+                {
+                    <div class="alert alert-info">
+                        <i class="bi bi-info-circle me-2"></i>
+                        Found <strong>@parsedReadings.Count</strong> blood pressure readings in the file.
+                        <span class="d-block mt-1">
+                            Date range: @parsedReadings.Min(r => r.Timestamp).ToString("d") - @parsedReadings.Max(r => r.Timestamp).ToString("d")
+                        </span>
+                    </div>
+
+                    <h6>Preview (first 5 readings):</h6>
+                    <div class="table-responsive mb-3">
+                        <table class="table table-sm table-bordered">
+                            <thead>
+                                <tr>
+                                    <th>Date/Time</th>
+                                    <th>Systolic</th>
+                                    <th>Diastolic</th>
+                                    <th>Pulse</th>
+                                    <th>Irregular</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var r in parsedReadings.OrderByDescending(x => x.Timestamp).Take(5))
+                                {
+                                    <tr>
+                                        <td>@r.Timestamp.ToString("g")</td>
+                                        <td>@r.Systolic</td>
+                                        <td>@r.Diastolic</td>
+                                        <td>@r.Pulse</td>
+                                        <td>@(r.IrregularHeartbeat ? "Yes" : "-")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <button class="btn btn-success" @onclick="UploadToGarmin">
+                        <i class="bi bi-cloud-upload me-1"></i>
+                        Upload to Garmin Connect
+                    </button>
+                }
+
+                @if (isUploading)
+                {
+                    <div class="mt-3">
+                        <div class="progress" style="height: 25px;">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated"
+                                 role="progressbar"
+                                 style="width: @progressPercent%"
+                                 aria-valuenow="@progressPercent"
+                                 aria-valuemin="0"
+                                 aria-valuemax="100">
+                                @progressPercent%
+                            </div>
+                        </div>
+                        <p class="text-muted mt-2 mb-0">@progressMessage</p>
+                    </div>
+                }
+            }
+        </div>
+    </div>
+
+    @* Results Section *@
+    @if (syncResult != null)
+    {
+        <div class="card mb-4">
+            <div class="card-header bg-success text-white">
+                <h5 class="mb-0">
+                    <i class="bi bi-check-circle me-2"></i>
+                    Upload Complete
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="row text-center mb-4">
+                    <div class="col-md-3">
+                        <div class="display-6 text-primary">@syncResult.TotalReadings</div>
+                        <div class="text-muted">Total Readings</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="display-6 text-success">@syncResult.Uploaded</div>
+                        <div class="text-muted">Uploaded</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="display-6 text-warning">@syncResult.Skipped</div>
+                        <div class="text-muted">Skipped (Duplicates)</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="display-6 text-danger">@syncResult.Failed</div>
+                        <div class="text-muted">Failed</div>
+                    </div>
+                </div>
+
+                @if (syncResult.UploadedReadings.Count > 0)
+                {
+                    <h6>Uploaded Readings:</h6>
+                    <div class="table-responsive" style="max-height: 300px; overflow-y: auto;">
+                        <table class="table table-sm table-striped">
+                            <thead class="sticky-top bg-white">
+                                <tr>
+                                    <th>Date/Time</th>
+                                    <th>Systolic</th>
+                                    <th>Diastolic</th>
+                                    <th>Pulse</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var reading in syncResult.UploadedReadings.OrderByDescending(r => r.Timestamp))
+                                {
+                                    <tr>
+                                        <td>@reading.Timestamp.ToString("g")</td>
+                                        <td><span class="badge bg-danger">@reading.Systolic</span></td>
+                                        <td><span class="badge bg-primary">@reading.Diastolic</span></td>
+                                        <td><span class="badge bg-secondary">@reading.Pulse</span></td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+
+                @* @if (syncResult.Errors.Count > 0)
+                {
+                    <div class="alert alert-warning mt-3">
+                        <h6><i class="bi bi-exclamation-triangle me-2"></i>Errors:</h6>
+                        <ul class="mb-0">
+                            @foreach (var error in syncResult.Errors.Take(10))
+                            {
+                                <li>@error</li>
+                            }
+                            @if (syncResult.Errors.Count > 10)
+                            {
+                                <li>... and @(syncResult.Errors.Count - 10) more</li>
+                            }
+                        </ul>
+                    </div>
+                } *@
+
+                <button class="btn btn-outline-primary mt-3" @onclick="Reset">
+                    <i class="bi bi-arrow-repeat me-1"></i>
+                    Upload Another File
+                </button>
+            </div>
+        </div>
+    }
+
+    @* Instructions *@
+    <div class="card">
+        <div class="card-header">
+            <h5 class="mb-0">
+                <i class="bi bi-question-circle me-2"></i>
+                How to export from OMRON Connect
+            </h5>
+        </div>
+        <div class="card-body">
+            <ol class="mb-0">
+                <li>Open the OMRON Connect app on your phone</li>
+                <li>Go to <strong>More</strong> (or Settings)</li>
+                <li>Select <strong>Export Data</strong> or <strong>Data Management</strong></li>
+                <li>Choose <strong>Blood Pressure</strong> data</li>
+                <li>Select the date range you want to export</li>
+                <li>Export as <strong>CSV</strong> and save/share the file</li>
+                <li>Upload the CSV file above</li>
+            </ol>
+        </div>
+    </div>
+</div>
+
+@* MFA Modal *@
+@if (showMfaModal)
+{
+    <div class="modal fade show d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.5);">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="bi bi-shield-lock me-2"></i>
+                        Two-Factor Authentication
+                    </h5>
+                </div>
+                <div class="modal-body">
+                    <p>Garmin requires a verification code. Please check your email or authenticator app.</p>
+                    <div class="mb-3">
+                        <label class="form-label">Verification Code</label>
+                        <input type="text"
+                               class="form-control form-control-lg text-center"
+                               @bind="mfaCode"
+                               @bind:event="oninput"
+                               placeholder="000000"
+                               maxlength="6"
+                               style="letter-spacing: 0.5em; font-family: monospace;" />
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" @onclick="CancelMfa">Cancel</button>
+                    <button type="button" class="btn btn-primary" @onclick="SubmitMfa" disabled="@(string.IsNullOrWhiteSpace(mfaCode) || mfaCode.Length < 6)">
+                        <i class="bi bi-check-lg me-1"></i>Verify
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private string email = "";
+    private string password = "";
+    private string? loginError;
+    private bool isLoggingIn;
+    private bool isUploading;
+    private int progressPercent;
+    private string progressMessage = "";
+    private List<BloodPressureReading> parsedReadings = [];
+    private SyncResult? syncResult;
+
+    // MFA state
+    private bool showMfaModal;
+    private string mfaCode = "";
+    private TaskCompletionSource<string?>? mfaCompletionSource;
+
+    protected override void OnInitialized()
+    {
+        // Subscribe to MFA code requests
+        GarminService.OnMfaCodeRequired += HandleMfaCodeRequired;
+    }
+
+    private async Task<string?> HandleMfaCodeRequired()
+    {
+        showMfaModal = true;
+        mfaCode = "";
+        mfaCompletionSource = new TaskCompletionSource<string?>();
+        await InvokeAsync(StateHasChanged);
+
+        // Wait for user to enter code or cancel
+        return await mfaCompletionSource.Task;
+    }
+
+    private void SubmitMfa()
+    {
+        showMfaModal = false;
+        mfaCompletionSource?.TrySetResult(mfaCode);
+        StateHasChanged();
+    }
+
+    private void CancelMfa()
+    {
+        showMfaModal = false;
+        mfaCompletionSource?.TrySetResult(null);
+        StateHasChanged();
+    }
+
+    private async Task Login()
+    {
+        loginError = null;
+        isLoggingIn = true;
+        StateHasChanged();
+
+        var (success, error) = await GarminService.LoginAsync(email, password);
+
+        if (!success)
+        {
+            loginError = error ?? "Login failed";
+        }
+        else
+        {
+            password = ""; // Clear password after successful login
+        }
+
+        isLoggingIn = false;
+    }
+
+    private void Logout()
+    {
+        GarminService.Logout();
+        Reset();
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        syncResult = null;
+        parsedReadings.Clear();
+
+        try
+        {
+            var file = e.File;
+            if (file == null)
+                return;
+
+            // Limit file size to 10MB
+            const long maxSize = 10 * 1024 * 1024;
+            await using var stream = file.OpenReadStream(maxSize);
+            using var memoryStream = new MemoryStream();
+            await stream.CopyToAsync(memoryStream);
+            memoryStream.Position = 0;
+
+            parsedReadings = CsvParser.ParseCsv(memoryStream);
+        }
+        catch (Exception ex)
+        {
+            loginError = $"Error reading file: {ex.Message}";
+        }
+    }
+
+    private async Task UploadToGarmin()
+    {
+        if (parsedReadings.Count == 0)
+            return;
+
+        isUploading = true;
+        progressPercent = 0;
+        progressMessage = "Starting upload...";
+        StateHasChanged();
+
+        var progress = new Progress<(int Current, int Total, string Message)>(p =>
+        {
+            progressPercent = (int)((double)p.Current / p.Total * 100);
+            progressMessage = p.Message;
+            InvokeAsync(StateHasChanged);
+        });
+
+        syncResult = await GarminService.UploadReadingsAsync(parsedReadings, progress);
+
+        isUploading = false;
+        progressPercent = 100;
+        progressMessage = "Complete!";
+    }
+
+    private void Reset()
+    {
+        parsedReadings.Clear();
+        syncResult = null;
+        progressPercent = 0;
+        progressMessage = "";
+        loginError = null;
+    }
+
+    public void Dispose()
+    {
+        GarminService.OnMfaCodeRequired -= HandleMfaCodeRequired;
+    }
+}

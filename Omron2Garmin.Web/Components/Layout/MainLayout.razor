@@ -1,0 +1,28 @@
+﻿@inherits LayoutComponentBase
+
+<div class="page">
+    <main class="w-100">
+        <nav class="navbar navbar-light bg-light border-bottom mb-3">
+            <div class="container">
+                <a class="navbar-brand" href="/">
+                    <i class="bi bi-heart-pulse text-danger me-2"></i>
+                    OMRON to Garmin
+                </a>
+            </div>
+        </nav>
+
+        <article>
+            @Body
+        </article>
+
+        <footer class="text-center text-muted py-4 mt-5 border-top">
+            <small>OMRON to Garmin Connect Sync Tool &copy; @DateTime.Now.Year</small>
+        </footer>
+    </main>
+</div>
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <span class="dismiss">🗙</span>
+</div>
