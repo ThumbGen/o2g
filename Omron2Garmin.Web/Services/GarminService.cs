@@ -274,8 +274,14 @@ public class GarminService : IDisposable
 
             try
             {
-                // Send timestamp exactly as read from CSV (in source timezone)
-                var timestampStr = reading.Timestamp.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+                // Convert timestamp to UTC properly using the source timezone
+                var offset = sourceTimeZone.GetUtcOffset(reading.Timestamp);
+                var dateTimeOffset = new DateTimeOffset(reading.Timestamp, offset);
+                var timestampUtc = dateTimeOffset.UtcDateTime;
+
+                // Format timestamps for Garmin API
+                var timestampLocalStr = reading.Timestamp.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+                var timestampUtcStr = timestampUtc.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
 
                 // Garmin weight API expects kg as double (not grams!)
                 var weightKg = reading.WeightKg;
@@ -283,8 +289,8 @@ public class GarminService : IDisposable
                 // Create the weight data payload matching Garmin's expected format
                 var weightData = new
                 {
-                    dateTimestamp = timestampStr,
-                    gmtTimestamp = timestampStr,
+                    dateTimestamp = timestampLocalStr,
+                    gmtTimestamp = timestampUtcStr,
                     unitKey = "kg",
                     value = weightKg
                 };
