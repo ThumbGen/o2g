@@ -3,6 +3,7 @@
 @using Omron2Garmin.Web.Services
 @inject GarminService GarminService
 @inject OmronCsvParser CsvParser
+@inject TimezoneService TimezoneService
 @rendermode InteractiveServer
 @implements IDisposable
 
@@ -15,7 +16,7 @@
                 <i class="bi bi-heart-pulse me-2"></i>
                 OMRON to Garmin Connect
             </h1>
-            <p class="lead text-muted">Upload your OMRON blood pressure CSV export to Garmin Connect</p>
+            <p class="lead text-muted">Upload your OMRON blood pressure and weight CSV export to Garmin Connect</p>
         </div>
     </div>
 
@@ -94,55 +95,137 @@
             }
             else
             {
-                <div class="mb-3">
-                    <label class="form-label">Select your OMRON Connect CSV export file</label>
-                    <InputFile class="form-control" OnChange="HandleFileSelected" accept=".csv" disabled="@isUploading" />
-                    <div class="form-text">
-                        Export your blood pressure data from the OMRON Connect app and upload the CSV file here.
+                <div class="row mb-3">
+                    <div class="col-md-8">
+                        <label class="form-label">Select your OMRON Connect CSV export file</label>
+                        <InputFile class="form-control" OnChange="HandleFileSelected" accept=".csv" disabled="@isUploading" />
+                        <div class="form-text">
+                            Export your data from the OMRON Connect app and upload the CSV file here.
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label">CSV Timezone</label>
+                        <select class="form-select" @bind="selectedTimezone" disabled="@isUploading">
+                            @foreach (var tz in availableTimezones)
+                            {
+                                <option value="@tz.IanaId">@tz.DisplayName</option>
+                            }
+                        </select>
+                        <div class="form-text">
+                            @if (!string.IsNullOrEmpty(detectedTimezone))
+                            {
+                                <i class="bi bi-check-circle text-success me-1"></i>
+                                <span>Auto-detected: @detectedTimezone</span>
+                            }
+                            else
+                            {
+                                <span>Timezone used when the CSV was exported</span>
+                            }
+                        </div>
                     </div>
                 </div>
 
-                @if (parsedReadings.Count > 0 && !isUploading && syncResult == null)
+                @if ((parsedReadings.Count > 0 || parsedWeights.Count > 0) && !isUploading && syncResult == null && weightSyncResult == null)
                 {
-                    <div class="alert alert-info">
-                        <i class="bi bi-info-circle me-2"></i>
-                        Found <strong>@parsedReadings.Count</strong> blood pressure readings in the file.
-                        <span class="d-block mt-1">
-                            Date range: @parsedReadings.Min(r => r.Timestamp).ToString("d") - @parsedReadings.Max(r => r.Timestamp).ToString("d")
-                        </span>
-                    </div>
+                    @* Blood Pressure Preview *@
+                    @if (parsedReadings.Count > 0)
+                    {
+                        <div class="alert alert-info">
+                            <i class="bi bi-heart-pulse me-2"></i>
+                            Found <strong>@parsedReadings.Count</strong> blood pressure readings.
+                            <span class="d-block mt-1">
+                                Date range: @parsedReadings.Min(r => r.Timestamp).ToString("d") - @parsedReadings.Max(r => r.Timestamp).ToString("d")
+                            </span>
+                        </div>
 
-                    <h6>Preview (first 5 readings):</h6>
-                    <div class="table-responsive mb-3">
-                        <table class="table table-sm table-bordered">
-                            <thead>
-                                <tr>
-                                    <th>Date/Time</th>
-                                    <th>Systolic</th>
-                                    <th>Diastolic</th>
-                                    <th>Pulse</th>
-                                    <th>Irregular</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                @foreach (var r in parsedReadings.OrderByDescending(x => x.Timestamp).Take(5))
-                                {
+                        <h6><i class="bi bi-heart-pulse me-1"></i>Blood Pressure Preview (last 5):</h6>
+                        <div class="table-responsive mb-3">
+                            <table class="table table-sm table-bordered">
+                                <thead>
                                     <tr>
-                                        <td>@r.Timestamp.ToString("g")</td>
-                                        <td>@r.Systolic</td>
-                                        <td>@r.Diastolic</td>
-                                        <td>@r.Pulse</td>
-                                        <td>@(r.IrregularHeartbeat ? "Yes" : "-")</td>
+                                        <th>Date/Time</th>
+                                        <th>Systolic</th>
+                                        <th>Diastolic</th>
+                                        <th>Pulse</th>
+                                        <th>Irregular</th>
                                     </tr>
-                                }
-                            </tbody>
-                        </table>
-                    </div>
+                                </thead>
+                                <tbody>
+                                    @foreach (var r in parsedReadings.OrderByDescending(x => x.Timestamp).Take(5))
+                                    {
+                                        <tr>
+                                            <td>@r.Timestamp.ToString("g")</td>
+                                            <td>@r.Systolic</td>
+                                            <td>@r.Diastolic</td>
+                                            <td>@r.Pulse</td>
+                                            <td>@(r.IrregularHeartbeat ? "Yes" : "-")</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
 
-                    <button class="btn btn-success" @onclick="UploadToGarmin">
-                        <i class="bi bi-cloud-upload me-1"></i>
-                        Upload to Garmin Connect
-                    </button>
+                    @* Weight Preview *@
+                    @if (parsedWeights.Count > 0)
+                    {
+                        <div class="alert alert-success">
+                            <i class="bi bi-speedometer me-2"></i>
+                            Found <strong>@parsedWeights.Count</strong> weight readings.
+                            <span class="d-block mt-1">
+                                Date range: @parsedWeights.Min(r => r.Timestamp).ToString("d") - @parsedWeights.Max(r => r.Timestamp).ToString("d")
+                            </span>
+                        </div>
+
+                        <h6><i class="bi bi-speedometer me-1"></i>Weight Preview (last 5):</h6>
+                        <div class="table-responsive mb-3">
+                            <table class="table table-sm table-bordered">
+                                <thead>
+                                    <tr>
+                                        <th>Date/Time</th>
+                                        <th>Weight (kg)</th>
+                                        <th>BMI</th>
+                                        <th>Category</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var w in parsedWeights.OrderByDescending(x => x.Timestamp).Take(5))
+                                    {
+                                        <tr>
+                                            <td>@w.Timestamp.ToString("g")</td>
+                                            <td>@w.WeightKg.ToString("F1")</td>
+                                            <td>@(w.Bmi?.ToString("F1") ?? "-")</td>
+                                            <td>@(w.Category ?? "-")</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+
+                    <div class="d-flex gap-2">
+                        @if (parsedReadings.Count > 0)
+                        {
+                            <button class="btn btn-danger" @onclick="UploadBloodPressure">
+                                <i class="bi bi-heart-pulse me-1"></i>
+                                Upload Blood Pressure (@parsedReadings.Count)
+                            </button>
+                        }
+                        @if (parsedWeights.Count > 0)
+                        {
+                            <button class="btn btn-success" @onclick="UploadWeight">
+                                <i class="bi bi-speedometer me-1"></i>
+                                Upload Weight (@parsedWeights.Count)
+                            </button>
+                        }
+                        @if (parsedReadings.Count > 0 && parsedWeights.Count > 0)
+                        {
+                            <button class="btn btn-primary" @onclick="UploadAll">
+                                <i class="bi bi-cloud-upload me-1"></i>
+                                Upload All
+                            </button>
+                        }
+                    </div>
                 }
 
                 @if (isUploading)
@@ -165,14 +248,14 @@
         </div>
     </div>
 
-    @* Results Section *@
+    @* Blood Pressure Results Section *@
     @if (syncResult != null)
     {
         <div class="card mb-4">
             <div class="card-header bg-success text-white">
                 <h5 class="mb-0">
                     <i class="bi bi-check-circle me-2"></i>
-                    Upload Complete
+                    Blood Pressure Upload Complete
                 </h5>
             </div>
             <div class="card-body">
@@ -223,7 +306,7 @@
                     </div>
                 }
 
-                @* @if (syncResult.Errors.Count > 0)
+                 @if (syncResult.Errors.Count > 0)
                 {
                     <div class="alert alert-warning mt-3">
                         <h6><i class="bi bi-exclamation-triangle me-2"></i>Errors:</h6>
@@ -238,7 +321,74 @@
                             }
                         </ul>
                     </div>
-                } *@
+                }
+
+                @if (weightSyncResult == null)
+                {
+                    <button class="btn btn-outline-primary mt-3" @onclick="Reset">
+                        <i class="bi bi-arrow-repeat me-1"></i>
+                        Upload Another File
+                    </button>
+                }
+            </div>
+        </div>
+    }
+
+    @* Weight Results Section *@
+    @if (weightSyncResult != null)
+    {
+        <div class="card mb-4">
+            <div class="card-header bg-success text-white">
+                <h5 class="mb-0">
+                    <i class="bi bi-speedometer me-2"></i>
+                    Weight Upload Complete
+                </h5>
+            </div>
+            <div class="card-body">
+                <div class="row text-center mb-4">
+                    <div class="col-md-3">
+                        <div class="display-6 text-primary">@weightSyncResult.TotalReadings</div>
+                        <div class="text-muted">Total Readings</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="display-6 text-success">@weightSyncResult.Uploaded</div>
+                        <div class="text-muted">Uploaded</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="display-6 text-warning">@weightSyncResult.Skipped</div>
+                        <div class="text-muted">Skipped (Duplicates)</div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="display-6 text-danger">@weightSyncResult.Failed</div>
+                        <div class="text-muted">Failed</div>
+                    </div>
+                </div>
+
+                @if (weightSyncResult.UploadedReadings.Count > 0)
+                {
+                    <h6>Uploaded Readings:</h6>
+                    <div class="table-responsive" style="max-height: 300px; overflow-y: auto;">
+                        <table class="table table-sm table-striped">
+                            <thead class="sticky-top bg-white">
+                                <tr>
+                                    <th>Date/Time</th>
+                                    <th>Weight</th>
+                                    <th>BMI</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var w in weightSyncResult.UploadedReadings.OrderByDescending(r => r.Timestamp))
+                                {
+                                    <tr>
+                                        <td>@w.Timestamp.ToString("g")</td>
+                                        <td><span class="badge bg-success">@w.WeightKg.ToString("F1") kg</span></td>
+                                        <td><span class="badge bg-info">@(w.Bmi?.ToString("F1") ?? "-")</span></td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
 
                 <button class="btn btn-outline-primary mt-3" @onclick="Reset">
                     <i class="bi bi-arrow-repeat me-1"></i>
@@ -261,7 +411,7 @@
                 <li>Open the OMRON Connect app on your phone</li>
                 <li>Go to <strong>More</strong> (or Settings)</li>
                 <li>Select <strong>Export Data</strong> or <strong>Data Management</strong></li>
-                <li>Choose <strong>Blood Pressure</strong> data</li>
+                <li>Choose <strong>All data</strong> (or specific: Blood Pressure, Weight)</li>
                 <li>Select the date range you want to export</li>
                 <li>Export as <strong>CSV</strong> and save/share the file</li>
                 <li>Upload the CSV file above</li>
@@ -315,17 +465,135 @@
     private int progressPercent;
     private string progressMessage = "";
     private List<BloodPressureReading> parsedReadings = [];
+    private List<WeightReading> parsedWeights = [];
     private SyncResult? syncResult;
+    private WeightSyncResult? weightSyncResult;
+
+    // Timezone settings
+    private string selectedTimezone = "UTC";
+    private string? detectedTimezone;
+    private List<TimezoneOption> availableTimezones = [];
 
     // MFA state
     private bool showMfaModal;
     private string mfaCode = "";
     private TaskCompletionSource<string?>? mfaCompletionSource;
 
-    protected override void OnInitialized()
+    protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        // Subscribe to MFA code requests
-        GarminService.OnMfaCodeRequired += HandleMfaCodeRequired;
+        if (firstRender)
+        {
+            // Initialize timezone list with common options
+            availableTimezones = GetCommonTimezones();
+
+            // Detect browser timezone
+            try
+            {
+                detectedTimezone = await TimezoneService.GetBrowserTimezoneAsync();
+                
+                // Set as selected if available in list
+                if (!string.IsNullOrEmpty(detectedTimezone) && 
+                    availableTimezones.Any(t => t.IanaId == detectedTimezone))
+                {
+                    selectedTimezone = detectedTimezone;
+                    StateHasChanged();
+                }
+            }
+            catch
+            {
+                // Fallback to UTC if detection fails
+                selectedTimezone = "UTC";
+            }
+
+            // Subscribe to MFA code requests
+            GarminService.OnMfaCodeRequired += HandleMfaCodeRequired;
+        }
+    }
+
+    private List<TimezoneOption> GetCommonTimezones()
+    {
+        var timezones = new List<TimezoneOption>
+        {
+            // Europe
+            new("Europe/London", "GMT Standard Time", "(UTC+00:00) London"),
+            new("Europe/Paris", "Romance Standard Time", "(UTC+01:00) Paris"),
+            new("Europe/Berlin", "W. Europe Standard Time", "(UTC+01:00) Berlin"),
+            new("Europe/Rome", "W. Europe Standard Time", "(UTC+01:00) Rome"),
+            new("Europe/Madrid", "Romance Standard Time", "(UTC+01:00) Madrid"),
+            new("Europe/Amsterdam", "W. Europe Standard Time", "(UTC+01:00) Amsterdam"),
+            new("Europe/Brussels", "Romance Standard Time", "(UTC+01:00) Brussels"),
+            new("Europe/Vienna", "W. Europe Standard Time", "(UTC+01:00) Vienna"),
+            new("Europe/Zurich", "W. Europe Standard Time", "(UTC+01:00) Zurich"),
+            new("Europe/Stockholm", "W. Europe Standard Time", "(UTC+01:00) Stockholm"),
+            new("Europe/Oslo", "W. Europe Standard Time", "(UTC+01:00) Oslo"),
+            new("Europe/Copenhagen", "Romance Standard Time", "(UTC+01:00) Copenhagen"),
+            new("Europe/Warsaw", "Central European Standard Time", "(UTC+01:00) Warsaw"),
+            new("Europe/Prague", "Central European Standard Time", "(UTC+01:00) Prague"),
+            new("Europe/Budapest", "Central Europe Standard Time", "(UTC+01:00) Budapest"),
+            new("Europe/Bucharest", "E. Europe Standard Time", "(UTC+02:00) Bucharest"),
+            new("Europe/Athens", "GTB Standard Time", "(UTC+02:00) Athens"),
+            new("Europe/Helsinki", "FLE Standard Time", "(UTC+02:00) Helsinki"),
+            new("Europe/Moscow", "Russian Standard Time", "(UTC+03:00) Moscow"),
+            // Americas
+            new("America/Los_Angeles", "Pacific Standard Time", "(UTC-08:00) Los Angeles"),
+            new("America/Denver", "Mountain Standard Time", "(UTC-07:00) Denver"),
+            new("America/Chicago", "Central Standard Time", "(UTC-06:00) Chicago"),
+            new("America/New_York", "Eastern Standard Time", "(UTC-05:00) New York"),
+            new("America/Toronto", "Eastern Standard Time", "(UTC-05:00) Toronto"),
+            new("America/Sao_Paulo", "E. South America Standard Time", "(UTC-03:00) São Paulo"),
+            // Asia/Pacific
+            new("Asia/Dubai", "Arabian Standard Time", "(UTC+04:00) Dubai"),
+            new("Asia/Singapore", "Singapore Standard Time", "(UTC+08:00) Singapore"),
+            new("Asia/Shanghai", "China Standard Time", "(UTC+08:00) Shanghai"),
+            new("Asia/Tokyo", "Tokyo Standard Time", "(UTC+09:00) Tokyo"),
+            new("Australia/Sydney", "AUS Eastern Standard Time", "(UTC+10:00) Sydney"),
+            // UTC
+            new("UTC", "UTC", "(UTC+00:00) UTC")
+        };
+
+        // Validate that we can resolve each timezone
+        return timezones.Where(t => t.TimeZoneInfo != null).ToList();
+    }
+
+    private TimeZoneInfo GetSelectedTimeZone()
+    {
+        var selected = availableTimezones.FirstOrDefault(t => t.IanaId == selectedTimezone);
+        return selected?.TimeZoneInfo ?? TimeZoneInfo.Utc;
+    }
+
+    /// <summary>
+    /// Represents a timezone option with IANA ID and display name
+    /// </summary>
+    private class TimezoneOption
+    {
+        public string IanaId { get; }
+        public string WindowsId { get; }
+        public string DisplayName { get; }
+        public TimeZoneInfo? TimeZoneInfo { get; }
+
+        public TimezoneOption(string ianaId, string windowsId, string displayName)
+        {
+            IanaId = ianaId;
+            WindowsId = windowsId;
+            DisplayName = displayName;
+
+            // Try IANA first (Linux/Mac), then Windows ID
+            try
+            {
+                TimeZoneInfo = TimeZoneInfo.FindSystemTimeZoneById(ianaId);
+            }
+            catch
+            {
+                try
+                {
+                    TimeZoneInfo = TimeZoneInfo.FindSystemTimeZoneById(windowsId);
+                }
+                catch
+                {
+                    TimeZoneInfo = null;
+                }
+            }
+        }
     }
 
     private async Task<string?> HandleMfaCodeRequired()
@@ -382,7 +650,9 @@
     private async Task HandleFileSelected(InputFileChangeEventArgs e)
     {
         syncResult = null;
+        weightSyncResult = null;
         parsedReadings.Clear();
+        parsedWeights.Clear();
 
         try
         {
@@ -397,7 +667,10 @@
             await stream.CopyToAsync(memoryStream);
             memoryStream.Position = 0;
 
-            parsedReadings = CsvParser.ParseCsv(memoryStream);
+            // Parse all data types from OMRON CSV
+            var parseResult = CsvParser.ParseAllData(memoryStream);
+            parsedReadings = parseResult.BloodPressureReadings;
+            parsedWeights = parseResult.WeightReadings;
         }
         catch (Exception ex)
         {
@@ -405,14 +678,14 @@
         }
     }
 
-    private async Task UploadToGarmin()
+    private async Task UploadBloodPressure()
     {
         if (parsedReadings.Count == 0)
             return;
 
         isUploading = true;
         progressPercent = 0;
-        progressMessage = "Starting upload...";
+        progressMessage = "Uploading blood pressure readings...";
         StateHasChanged();
 
         var progress = new Progress<(int Current, int Total, string Message)>(p =>
@@ -422,17 +695,94 @@
             InvokeAsync(StateHasChanged);
         });
 
-        syncResult = await GarminService.UploadReadingsAsync(parsedReadings, progress);
+        var timezone = GetSelectedTimeZone();
+        syncResult = await GarminService.UploadReadingsAsync(parsedReadings, timezone, progress);
 
         isUploading = false;
         progressPercent = 100;
-        progressMessage = "Complete!";
+        progressMessage = "Blood pressure upload complete!";
+    }
+
+    private async Task UploadWeight()
+    {
+        if (parsedWeights.Count == 0)
+            return;
+
+        isUploading = true;
+        progressPercent = 0;
+        progressMessage = "Uploading weight readings...";
+        StateHasChanged();
+
+        var progress = new Progress<(int Current, int Total, string Message)>(p =>
+        {
+            progressPercent = (int)((double)p.Current / p.Total * 100);
+            progressMessage = p.Message;
+            InvokeAsync(StateHasChanged);
+        });
+
+        var timezone = GetSelectedTimeZone();
+        weightSyncResult = await GarminService.UploadWeightReadingsAsync(parsedWeights, timezone, progress);
+
+        isUploading = false;
+        progressPercent = 100;
+        progressMessage = "Weight upload complete!";
+    }
+
+    private async Task UploadAll()
+    {
+        isUploading = true;
+        progressPercent = 0;
+        StateHasChanged();
+
+        var totalItems = parsedReadings.Count + parsedWeights.Count;
+        var processedItems = 0;
+        var timezone = GetSelectedTimeZone();
+
+        // Upload blood pressure first
+        if (parsedReadings.Count > 0)
+        {
+            progressMessage = "Uploading blood pressure readings...";
+            StateHasChanged();
+
+            var bpProgress = new Progress<(int Current, int Total, string Message)>(p =>
+            {
+                processedItems = p.Current;
+                progressPercent = (int)((double)processedItems / totalItems * 100);
+                progressMessage = p.Message;
+                InvokeAsync(StateHasChanged);
+            });
+
+            syncResult = await GarminService.UploadReadingsAsync(parsedReadings, timezone, bpProgress);
+        }
+
+        // Then upload weight
+        if (parsedWeights.Count > 0)
+        {
+            progressMessage = "Uploading weight readings...";
+            StateHasChanged();
+
+            var weightProgress = new Progress<(int Current, int Total, string Message)>(p =>
+            {
+                processedItems = parsedReadings.Count + p.Current;
+                progressPercent = (int)((double)processedItems / totalItems * 100);
+                progressMessage = p.Message;
+                InvokeAsync(StateHasChanged);
+            });
+
+            weightSyncResult = await GarminService.UploadWeightReadingsAsync(parsedWeights, timezone, weightProgress);
+        }
+
+        isUploading = false;
+        progressPercent = 100;
+        progressMessage = "All uploads complete!";
     }
 
     private void Reset()
     {
         parsedReadings.Clear();
+        parsedWeights.Clear();
         syncResult = null;
+        weightSyncResult = null;
         progressPercent = 0;
         progressMessage = "";
         loginError = null;

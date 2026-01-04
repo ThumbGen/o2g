@@ -2,6 +2,7 @@ using Garmin.Connect;
 using Garmin.Connect.Auth;
 using Garmin.Connect.Models;
 using Omron2Garmin.Web.Models;
+using System.Globalization;
 
 namespace Omron2Garmin.Web.Services;
 
@@ -82,11 +83,9 @@ public class GarminService : IDisposable
     /// </summary>
     public async Task<SyncResult> UploadReadingsAsync(
         List<BloodPressureReading> readings,
+        TimeZoneInfo sourceTimeZone,
         IProgress<(int Current, int Total, string Message)>? progress = null)
     {
-        // TEMP: Limit to 2 readings for testing
-        //readings = readings.Take(2).ToList();
-
         var result = new SyncResult
         {
             TotalReadings = readings.Count
@@ -98,9 +97,9 @@ public class GarminService : IDisposable
             return result;
         }
 
-        // Step 1: Get unique dates from readings to upload
+        // Step 1: Get unique dates from readings to upload (convert to UTC first)
         var uniqueDates = readings
-            .Select(r => r.Timestamp.Kind == DateTimeKind.Utc ? r.Timestamp.Date : r.Timestamp.ToUniversalTime().Date)
+            .Select(r => ConvertToUtc(r.Timestamp, sourceTimeZone).Date)
             .Distinct()
             .ToList();
 
@@ -120,18 +119,10 @@ public class GarminService : IDisposable
                 }).ToList() ?? [];
 
                 existingByDate[date] = dailyReadings;
-
-                // Log for debugging
-                // result.Errors.Add($"DEBUG: Date {date:yyyy-MM-dd} has {dailyReadings.Count} readings in Garmin");
-                // foreach (var e in dailyReadings)
-                // {
-                //     result.Errors.Add($"  Garmin: {e.Systolic}/{e.Diastolic} | P:{e.Pulse}");
-                // }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 existingByDate[date] = [];
-                result.Errors.Add($"DEBUG: Error getting readings for {date:d}: {ex.Message}");
             }
         }
 
@@ -142,14 +133,9 @@ public class GarminService : IDisposable
             current++;
             progress?.Report((current, readings.Count, $"Processing {reading.Timestamp:g}..."));
 
-            // Convert CSV reading timestamp to UTC
-            var readingUtc = reading.Timestamp.Kind == DateTimeKind.Utc
-                ? reading.Timestamp
-                : reading.Timestamp.ToUniversalTime();
+            // Convert CSV reading timestamp to UTC using provided timezone
+            var readingUtc = ConvertToUtc(reading.Timestamp, sourceTimeZone);
             var targetDate = readingUtc.Date;
-
-            // Log what we're trying to upload
-            result.Errors.Add($"  CSV ({targetDate:yyyy-MM-dd}): {reading.Systolic}/{reading.Diastolic} | P:{reading.Pulse}");
 
             // Get existing readings for this date
             var existingReadings = existingByDate.GetValueOrDefault(targetDate, []);
@@ -163,7 +149,6 @@ public class GarminService : IDisposable
             if (isDuplicate)
             {
                 result.Skipped++;
-                result.Errors.Add($"    -> SKIPPED (found reading with same values)");
                 continue;
             }
 
@@ -180,12 +165,22 @@ public class GarminService : IDisposable
                 var systolic = Math.Clamp(reading.Systolic, 40, 300);
                 var diastolic = Math.Clamp(reading.Diastolic, 30, 200);
 
+                // Garmin timezone handling:
+                // The library calls ToUniversalTime() which subtracts the server's timezone offset.
+                // To compensate, we add the source timezone offset to the original CSV time.
+                // Example: CSV=9:34 in GMT+1, we add +1h → send 10:34 Unspecified
+                //          Library does: 10:34 - 1h (server GMT+1) = 9:34 UTC
+                //          Garmin stores 9:34 UTC and displays it correctly
+                var offset = sourceTimeZone.GetUtcOffset(reading.Timestamp);
+                var measurementDateTime = reading.Timestamp.Add(offset);
+                measurementDateTime = DateTime.SpecifyKind(measurementDateTime, DateTimeKind.Unspecified);
+
                 var bloodPressure = new GarminBloodPressure
                 {
                     Systolic = systolic,
                     Diastolic = diastolic,
                     Pulse = pulse,
-                    MeasurementDateTime = reading.Timestamp,
+                    MeasurementDateTime = measurementDateTime,
                     Notes = reading.IrregularHeartbeat ? "Irregular heartbeat detected" : reading.Notes
                 };
 
@@ -216,6 +211,147 @@ public class GarminService : IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Upload weight readings to Garmin Connect
+    /// </summary>
+    public async Task<WeightSyncResult> UploadWeightReadingsAsync(
+        List<WeightReading> readings,
+        TimeZoneInfo sourceTimeZone,
+        IProgress<(int Current, int Total, string Message)>? progress = null)
+    {
+        var result = new WeightSyncResult
+        {
+            TotalReadings = readings.Count
+        };
+
+        if (_client == null || _context == null)
+        {
+            result.Errors.Add("Not authenticated with Garmin Connect");
+            return result;
+        }
+
+        // Get existing weights to avoid duplicates (convert to UTC first)
+        var startDate = readings.Min(r => ConvertToUtc(r.Timestamp, sourceTimeZone)).Date;
+        var endDate = readings.Max(r => ConvertToUtc(r.Timestamp, sourceTimeZone)).Date;
+
+        List<(DateOnly Date, double Weight)> existingWeights = [];
+        try
+        {
+            var existingRange = await _client.GetWeightRange(startDate, endDate);
+            if (existingRange?.DailyWeightSummaries != null)
+            {
+                existingWeights = existingRange.DailyWeightSummaries
+                    .Where(w => w.LatestWeight?.Weight != null)
+                    .Select(w => (w.SummaryDate, (double)w.LatestWeight!.Weight / 1000.0)) // Convert grams to kg
+                    .ToList();
+            }
+        }
+        catch (Exception ex)
+        {
+            result.Errors.Add($"Warning: Could not fetch existing weights: {ex.Message}");
+        }
+
+        var current = 0;
+        foreach (var reading in readings)
+        {
+            current++;
+            progress?.Report((current, readings.Count, $"Processing weight {reading.WeightKg:F1} kg from {reading.Timestamp:g}..."));
+
+            // Skip invalid weight values
+            if (reading.WeightKg <= 0 || reading.WeightKg < 30 || reading.WeightKg > 500)
+            {
+                result.Skipped++;
+                result.Errors.Add($"Skipped invalid weight: {reading.WeightKg:F1} kg at {reading.Timestamp:g}");
+                continue;
+            }
+
+            // Convert to UTC using provided timezone
+            var readingUtc = ConvertToUtc(reading.Timestamp, sourceTimeZone);
+            var readingDate = DateOnly.FromDateTime(readingUtc);
+
+            // Check for duplicate (same date and very similar weight)
+            var isDuplicate = existingWeights.Any(e =>
+                e.Date == readingDate &&
+                Math.Abs(e.Weight - reading.WeightKg) < 0.05);
+
+            if (isDuplicate)
+            {
+                result.Skipped++;
+                continue;
+            }
+
+            try
+            {
+                // For weight API, we send the timestamp directly as string
+                // The API expects GMT timestamp, so send the UTC time directly
+                var timestampStr = readingUtc.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+
+                // Garmin weight API expects kg as double (not grams!)
+                var weightKg = reading.WeightKg;
+
+                // Create the weight data payload matching Garmin's expected format
+                var weightData = new
+                {
+                    dateTimestamp = timestampStr,
+                    gmtTimestamp = timestampStr,
+                    unitKey = "kg",
+                    value = weightKg
+                };
+
+                // Use the internal context to make the POST request
+                var response = await _context.MakeHttpPost(
+                    "/weight-service/user-weight",
+                    weightData);
+
+                if (response.IsSuccessStatusCode)
+                {
+                    result.Uploaded++;
+                    result.UploadedReadings.Add(reading);
+                    existingWeights.Add((readingDate, reading.WeightKg));
+                }
+                else
+                {
+                    result.Failed++;
+                    var responseBody = await response.Content.ReadAsStringAsync();
+                    result.Errors.Add($"Failed to upload weight at {reading.Timestamp:g}: {response.StatusCode} - {responseBody}");
+                }
+
+                await Task.Delay(300);
+            }
+            catch (Exception ex)
+            {
+                result.Failed++;
+                result.Errors.Add($"Failed to upload weight at {reading.Timestamp:g}: {ex.GetType().Name}: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    result.Errors.Add($"  Inner: {ex.InnerException.Message}");
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Convert a DateTime from the source timezone to UTC
+    /// </summary>
+    private static DateTime ConvertToUtc(DateTime dateTime, TimeZoneInfo sourceTimeZone)
+    {
+        // If already UTC, return as is
+        if (dateTime.Kind == DateTimeKind.Utc)
+            return dateTime;
+
+        // If Local, convert using system timezone (though we should use source timezone)
+        if (dateTime.Kind == DateTimeKind.Local)
+        {
+            // Treat as if it's in the source timezone
+            dateTime = DateTime.SpecifyKind(dateTime, DateTimeKind.Unspecified);
+        }
+
+        // Convert from source timezone to UTC
+        return TimeZoneInfo.ConvertTimeToUtc(dateTime, sourceTimeZone);
     }
 
     public void Dispose()

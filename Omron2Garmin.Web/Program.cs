@@ -10,6 +10,7 @@ builder.Services.AddRazorComponents()
 // Register application services
 builder.Services.AddScoped<GarminService>();
 builder.Services.AddSingleton<OmronCsvParser>();
+builder.Services.AddScoped<TimezoneService>();
 
 var app = builder.Build();
 
@@ -28,4 +29,4 @@ app.UseStaticFiles();
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
 
-app.Run();
+await app.RunAsync();
