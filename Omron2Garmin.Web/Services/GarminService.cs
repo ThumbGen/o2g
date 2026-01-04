@@ -91,34 +91,32 @@ public class GarminService : IDisposable
             TotalReadings = readings.Count
         };
 
-        if (_client == null)
+        if (_client == null || _context == null)
         {
             result.Errors.Add("Not authenticated with Garmin Connect");
             return result;
         }
 
-        // Step 1: Get unique dates from readings to upload (convert to UTC first)
+        // Step 1: Get unique dates from readings to upload
         var uniqueDates = readings
-            .Select(r => ConvertToUtc(r.Timestamp, sourceTimeZone).Date)
+            .Select(r => DateOnly.FromDateTime(r.Timestamp))
             .Distinct()
             .ToList();
 
         // Step 2: Fetch existing readings from Garmin for each unique date
-        var existingByDate = new Dictionary<DateTime, List<BloodPressureReading>>();
+        var existingByDate = new Dictionary<DateOnly, List<(int Systolic, int Diastolic, int Pulse)>>();
         foreach (var date in uniqueDates)
         {
             try
             {
-                var dailyReading = await _client.GetBloodPressureDaily(date);
-                var dailyReadings = dailyReading?.BloodPressureMeasurements?.Select(r => new BloodPressureReading
-                {
-                    Timestamp = r.MeasurementTimestampGmt,
-                    Systolic = (int)r.Systolic,
-                    Diastolic = (int)r.Diastolic,
-                    Pulse = (int)r.Pulse
-                }).ToList() ?? [];
+                var dailyReading = await _client.GetBloodPressureDaily(date.ToDateTime(TimeOnly.MinValue));
+                var dailyValues = dailyReading?.BloodPressureMeasurements?.Select(r => (
+                    Systolic: (int)r.Systolic,
+                    Diastolic: (int)r.Diastolic,
+                    Pulse: (int)r.Pulse
+                )).ToList() ?? [];
 
-                existingByDate[date] = dailyReadings;
+                existingByDate[date] = dailyValues;
             }
             catch (Exception)
             {
@@ -133,12 +131,10 @@ public class GarminService : IDisposable
             current++;
             progress?.Report((current, readings.Count, $"Processing {reading.Timestamp:g}..."));
 
-            // Convert CSV reading timestamp to UTC using provided timezone
-            var readingUtc = ConvertToUtc(reading.Timestamp, sourceTimeZone);
-            var targetDate = readingUtc.Date;
+            var readingDate = DateOnly.FromDateTime(reading.Timestamp);
 
             // Get existing readings for this date
-            var existingReadings = existingByDate.GetValueOrDefault(targetDate, []);
+            var existingReadings = existingByDate.GetValueOrDefault(readingDate, []);
 
             // Check for duplicates - same VALUES (systolic, diastolic, pulse)
             var isDuplicate = existingReadings.Any(e =>
@@ -165,26 +161,18 @@ public class GarminService : IDisposable
                 var systolic = Math.Clamp(reading.Systolic, 40, 300);
                 var diastolic = Math.Clamp(reading.Diastolic, 30, 200);
 
-                // Garmin timezone handling:
-                // The library calls ToUniversalTime() which subtracts the server's timezone offset.
-                // To compensate, we add the source timezone offset to the original CSV time.
-                // Example: CSV=9:34 in GMT+1, we add +1h → send 10:34 Unspecified
-                //          Library does: 10:34 - 1h (server GMT+1) = 9:34 UTC
-                //          Garmin stores 9:34 UTC and displays it correctly
-                var offset = sourceTimeZone.GetUtcOffset(reading.Timestamp);
-                var measurementDateTime = reading.Timestamp.Add(offset);
-                measurementDateTime = DateTime.SpecifyKind(measurementDateTime, DateTimeKind.Unspecified);
-
-                var bloodPressure = new GarminBloodPressure
+                // Use the Garmin.Connect library's AddBloodPressure method
+                // The library will handle timestamp conversion internally
+                var garminReading = new GarminBloodPressure
                 {
                     Systolic = systolic,
                     Diastolic = diastolic,
                     Pulse = pulse,
-                    MeasurementDateTime = measurementDateTime,
+                    MeasurementDateTime = reading.Timestamp, // Send timestamp as-is from CSV
                     Notes = reading.IrregularHeartbeat ? "Irregular heartbeat detected" : reading.Notes
                 };
 
-                var success = await _client.AddBloodPressure(bloodPressure);
+                var success = await _client.AddBloodPressure(garminReading);
 
                 if (success)
                 {
@@ -192,12 +180,12 @@ public class GarminService : IDisposable
                     result.UploadedReadings.Add(reading);
 
                     // Add to existing readings to prevent duplicates within the same batch
-                    existingByDate[targetDate].Add(reading);
+                    existingByDate[readingDate].Add((systolic, diastolic, pulse));
                 }
                 else
                 {
                     result.Failed++;
-                    result.Errors.Add($"Failed to upload reading at {reading.Timestamp:g}: Validation failed");
+                    result.Errors.Add($"Failed to upload reading at {reading.Timestamp:g}: Upload returned false");
                 }
 
                 // Small delay to be respectful to the API
@@ -206,7 +194,11 @@ public class GarminService : IDisposable
             catch (Exception ex)
             {
                 result.Failed++;
-                result.Errors.Add($"Failed to upload reading at {reading.Timestamp:g}: {ex.Message}");
+                result.Errors.Add($"Failed to upload reading at {reading.Timestamp:g}: {ex.GetType().Name}: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    result.Errors.Add($"  Inner: {ex.InnerException.Message}");
+                }
             }
         }
 
@@ -232,9 +224,9 @@ public class GarminService : IDisposable
             return result;
         }
 
-        // Get existing weights to avoid duplicates (convert to UTC first)
-        var startDate = readings.Min(r => ConvertToUtc(r.Timestamp, sourceTimeZone)).Date;
-        var endDate = readings.Max(r => ConvertToUtc(r.Timestamp, sourceTimeZone)).Date;
+        // Get existing weights to avoid duplicates
+        var startDate = readings.Min(r => r.Timestamp).Date;
+        var endDate = readings.Max(r => r.Timestamp).Date;
 
         List<(DateOnly Date, double Weight)> existingWeights = [];
         try
@@ -267,9 +259,7 @@ public class GarminService : IDisposable
                 continue;
             }
 
-            // Convert to UTC using provided timezone
-            var readingUtc = ConvertToUtc(reading.Timestamp, sourceTimeZone);
-            var readingDate = DateOnly.FromDateTime(readingUtc);
+            var readingDate = DateOnly.FromDateTime(reading.Timestamp);
 
             // Check for duplicate (same date and very similar weight)
             var isDuplicate = existingWeights.Any(e =>
@@ -284,9 +274,8 @@ public class GarminService : IDisposable
 
             try
             {
-                // For weight API, we send the timestamp directly as string
-                // The API expects GMT timestamp, so send the UTC time directly
-                var timestampStr = readingUtc.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+                // Send timestamp exactly as read from CSV (in source timezone)
+                var timestampStr = reading.Timestamp.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
 
                 // Garmin weight API expects kg as double (not grams!)
                 var weightKg = reading.WeightKg;
@@ -332,26 +321,6 @@ public class GarminService : IDisposable
         }
 
         return result;
-    }
-
-    /// <summary>
-    /// Convert a DateTime from the source timezone to UTC
-    /// </summary>
-    private static DateTime ConvertToUtc(DateTime dateTime, TimeZoneInfo sourceTimeZone)
-    {
-        // If already UTC, return as is
-        if (dateTime.Kind == DateTimeKind.Utc)
-            return dateTime;
-
-        // If Local, convert using system timezone (though we should use source timezone)
-        if (dateTime.Kind == DateTimeKind.Local)
-        {
-            // Treat as if it's in the source timezone
-            dateTime = DateTime.SpecifyKind(dateTime, DateTimeKind.Unspecified);
-        }
-
-        // Convert from source timezone to UTC
-        return TimeZoneInfo.ConvertTimeToUtc(dateTime, sourceTimeZone);
     }
 
     public void Dispose()
