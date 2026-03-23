@@ -7,53 +7,136 @@ using System.Globalization;
 namespace Omron2Garmin.Web.Services;
 
 /// <summary>
-/// Service for interacting with Garmin Connect
+/// Service for interacting with Garmin Connect with rate-limit protection.
+/// 
+/// IMPORTANT: Garmin Connect has aggressive rate limiting on login attempts.
+/// The OAuth flow makes multiple requests, so even a single login attempt
+/// can trigger rate limiting if done too frequently. This service implements:
+/// - Session reuse to avoid re-authenticating with same credentials
+/// - Minimum intervals between login attempts
+/// - Exponential backoff when rate limited
 /// </summary>
 public class GarminService : IDisposable
 {
     private GarminConnectContext? _context;
     private GarminConnectClient? _client;
+    private HttpClient? _httpClient;
     private string? _displayName;
+    private string? _cachedEmail;
+    private string? _cachedPasswordHash;
+    private DateTime _lastSuccessfulLogin = DateTime.MinValue;
+    private DateTime _lastLoginAttempt = DateTime.MinValue;
+    private DateTime _rateLimitedUntil = DateTime.MinValue;
+    private int _consecutiveFailures = 0;
+
+    // Minimum time between login attempts to avoid rate limiting
+    private static readonly TimeSpan MinLoginInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan RateLimitCooldown = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan SessionValidityDuration = TimeSpan.FromHours(1);
+    private const int MaxConsecutiveFailures = 3;
 
     public bool IsAuthenticated => _client != null && !string.IsNullOrEmpty(_displayName);
     public string? DisplayName => _displayName;
+    public bool IsRateLimited => DateTime.UtcNow < _rateLimitedUntil;
+    public TimeSpan? RateLimitRemainingTime => IsRateLimited ? _rateLimitedUntil - DateTime.UtcNow : null;
 
     // Event for MFA code request
     public event Func<Task<string?>>? OnMfaCodeRequired;
 
     /// <summary>
-    /// Login to Garmin Connect with MFA support
+    /// Login to Garmin Connect with MFA support and rate-limit protection
     /// </summary>
     public async Task<(bool Success, string? Error)> LoginAsync(string email, string password)
     {
+        // Check if we're currently rate-limited
+        if (IsRateLimited)
+        {
+            var remaining = RateLimitRemainingTime!.Value;
+            return (false, $"Rate-limited by Garmin Connect. Please wait {remaining.Minutes} minutes and {remaining.Seconds} seconds before trying again.");
+        }
+
+        // Check if we can reuse existing session (same credentials, session still valid)
+        var passwordHash = ComputeSimpleHash(password);
+        if (_client != null && _cachedEmail == email && _cachedPasswordHash == passwordHash)
+        {
+            // Check if session is likely still valid (within validity window)
+            var sessionAge = DateTime.UtcNow - _lastSuccessfulLogin;
+            if (sessionAge < SessionValidityDuration)
+            {
+                try
+                {
+                    // Verify existing session is still valid
+                    var profile = await _client.GetSocialProfile();
+                    if (profile != null)
+                    {
+                        _displayName = profile.DisplayName;
+                        return (true, null);
+                    }
+                }
+                catch
+                {
+                    // Session expired, need to re-authenticate
+                    CleanupSession();
+                }
+            }
+            else
+            {
+                // Session too old, clean up
+                CleanupSession();
+            }
+        }
+
+        // Enforce minimum interval between NEW login attempts (not session reuse)
+        var timeSinceLastAttempt = DateTime.UtcNow - _lastLoginAttempt;
+        if (timeSinceLastAttempt < MinLoginInterval)
+        {
+            var waitTime = MinLoginInterval - timeSinceLastAttempt;
+            return (false, $"Please wait {waitTime.Seconds} seconds before attempting to login again. Garmin rate-limits frequent login attempts.");
+        }
+
+        _lastLoginAttempt = DateTime.UtcNow;
+
         try
         {
             var authParameters = new BasicAuthParameters(email, password);
             var mfaCodeProvider = new InteractiveMfaCodeProvider(this);
 
-            _context = new GarminConnectContext(new HttpClient(), authParameters, mfaCodeProvider);
+            // Reuse HttpClient to maintain connection pooling
+            _httpClient ??= new HttpClient();
+
+            _context = new GarminConnectContext(_httpClient, authParameters, mfaCodeProvider);
             _client = new GarminConnectClient(_context);
 
             // Verify authentication by getting user profile
             var profile = await _client.GetSocialProfile();
             _displayName = profile.DisplayName;
 
+            // Cache credentials for session reuse
+            _cachedEmail = email;
+            _cachedPasswordHash = passwordHash;
+            _consecutiveFailures = 0;
+            _lastSuccessfulLogin = DateTime.UtcNow;
+
             return (true, null);
         }
         catch (Exception ex)
         {
-            _context = null;
-            _client = null;
-            _displayName = null;
+            CleanupSession();
+            _consecutiveFailures++;
 
             bool isRateLimited = ex.Message.Contains("Rate limited") ||
                                  ex.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ||
                                  ex.Message.Contains("429", StringComparison.OrdinalIgnoreCase) ||
-                                 ex.Message.Contains("too many", StringComparison.OrdinalIgnoreCase);
+                                 ex.Message.Contains("too many", StringComparison.OrdinalIgnoreCase) ||
+                                 ex.Message.Contains("Forbidden", StringComparison.OrdinalIgnoreCase);
 
-            if (isRateLimited)
+            if (isRateLimited || _consecutiveFailures >= MaxConsecutiveFailures)
             {
-                return (false, "Garmin Connect is rate-limiting login attempts. Please wait 15-30 minutes before trying again.");
+                // Apply exponential backoff for rate limiting, starting from RateLimitCooldown
+                var multiplier = Math.Pow(2, Math.Min(_consecutiveFailures - 1, 3));
+                var cooldown = TimeSpan.FromTicks((long)(RateLimitCooldown.Ticks * multiplier));
+                _rateLimitedUntil = DateTime.UtcNow + cooldown;
+                return (false, $"Garmin Connect is rate-limiting login attempts. Please wait {cooldown.TotalMinutes:F0} minutes before trying again.");
             }
 
             if (ex.Message.Contains("401") || ex.Message.Contains("Unauthorized"))
@@ -63,6 +146,25 @@ public class GarminService : IDisposable
 
             return (false, ex.Message);
         }
+    }
+
+    private void CleanupSession()
+    {
+        _context = null;
+        _client = null;
+        _displayName = null;
+        // Don't dispose HttpClient - it can be reused
+    }
+
+    private static string ComputeSimpleHash(string input)
+    {
+        // Simple hash for credential comparison (not for security)
+        var hash = 0;
+        foreach (var c in input)
+        {
+            hash = ((hash << 5) - hash) + c;
+        }
+        return hash.ToString("X8");
     }
 
     /// <summary>
@@ -82,9 +184,19 @@ public class GarminService : IDisposable
     /// </summary>
     public void Logout()
     {
-        _context = null;
-        _client = null;
-        _displayName = null;
+        CleanupSession();
+        _cachedEmail = null;
+        _cachedPasswordHash = null;
+        _consecutiveFailures = 0;
+    }
+
+    /// <summary>
+    /// Reset rate limit state (use with caution, only after waiting the required time)
+    /// </summary>
+    public void ResetRateLimitState()
+    {
+        _rateLimitedUntil = DateTime.MinValue;
+        _consecutiveFailures = 0;
     }
 
     /// <summary>
@@ -181,7 +293,9 @@ public class GarminService : IDisposable
                     Notes = reading.IrregularHeartbeat ? "Irregular heartbeat detected" : reading.Notes
                 };
 
-                var success = await _client.AddBloodPressure(garminReading);
+                var success = await ExecuteWithRetryAsync(
+                    async () => await _client.AddBloodPressure(garminReading),
+                    maxRetries: 3);
 
                 if (success)
                 {
@@ -197,12 +311,19 @@ public class GarminService : IDisposable
                     result.Errors.Add($"Failed to upload reading at {reading.Timestamp:g}: Upload returned false");
                 }
 
-                // Small delay to be respectful to the API
-                await Task.Delay(300);
+                // Adaptive delay to be respectful to the API
+                await Task.Delay(500);
             }
             catch (Exception ex)
             {
                 result.Failed++;
+
+                if (IsRateLimitException(ex))
+                {
+                    result.Errors.Add($"Rate limited during upload. Stopping to prevent further issues.");
+                    break; // Stop processing to avoid more rate limiting
+                }
+
                 result.Errors.Add($"Failed to upload reading at {reading.Timestamp:g}: {ex.GetType().Name}: {ex.Message}");
                 if (ex.InnerException != null)
                 {
@@ -212,6 +333,45 @@ public class GarminService : IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Execute an operation with exponential backoff retry
+    /// </summary>
+    private static async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> operation, int maxRetries = 3)
+    {
+        var delay = TimeSpan.FromSeconds(1);
+
+        for (var attempt = 0; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                return await operation();
+            }
+            catch (Exception ex) when (attempt < maxRetries && IsTransientException(ex))
+            {
+                await Task.Delay(delay);
+                delay *= 2; // Exponential backoff
+            }
+        }
+
+        return await operation(); // Final attempt, let exception propagate
+    }
+
+    private static bool IsTransientException(Exception ex)
+    {
+        return ex.Message.Contains("503") ||
+               ex.Message.Contains("502") ||
+               ex.Message.Contains("504") ||
+               ex.Message.Contains("timeout", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsRateLimitException(Exception ex)
+    {
+        return ex.Message.Contains("429") ||
+               ex.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ||
+               ex.Message.Contains("too many", StringComparison.OrdinalIgnoreCase) ||
+               ex.Message.Contains("Forbidden", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -315,6 +475,12 @@ public class GarminService : IDisposable
                     result.UploadedReadings.Add(reading);
                     existingWeights.Add((readingDate, reading.WeightKg));
                 }
+                else if ((int)response.StatusCode == 429 || response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    result.Failed++;
+                    result.Errors.Add($"Rate limited during weight upload. Stopping to prevent further issues.");
+                    break;
+                }
                 else
                 {
                     result.Failed++;
@@ -322,11 +488,19 @@ public class GarminService : IDisposable
                     result.Errors.Add($"Failed to upload weight at {reading.Timestamp:g}: {response.StatusCode} - {responseBody}");
                 }
 
-                await Task.Delay(300);
+                // Adaptive delay to be respectful to the API
+                await Task.Delay(500);
             }
             catch (Exception ex)
             {
                 result.Failed++;
+
+                if (IsRateLimitException(ex))
+                {
+                    result.Errors.Add($"Rate limited during weight upload. Stopping to prevent further issues.");
+                    break;
+                }
+
                 result.Errors.Add($"Failed to upload weight at {reading.Timestamp:g}: {ex.GetType().Name}: {ex.Message}");
                 if (ex.InnerException != null)
                 {
@@ -340,8 +514,9 @@ public class GarminService : IDisposable
 
     public void Dispose()
     {
-        _context = null;
-        _client = null;
+        CleanupSession();
+        _httpClient?.Dispose();
+        _httpClient = null;
     }
 }
 
