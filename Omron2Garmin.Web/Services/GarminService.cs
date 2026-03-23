@@ -12,19 +12,19 @@ namespace Omron2Garmin.Web.Services;
 /// IMPORTANT: Garmin Connect has aggressive rate limiting on login attempts.
 /// The OAuth flow makes multiple requests, so even a single login attempt
 /// can trigger rate limiting if done too frequently. This service implements:
-/// - Session reuse to avoid re-authenticating with same credentials
+/// - Per-user session persistence across Blazor circuit reconnections
 /// - Minimum intervals between login attempts
 /// - Exponential backoff when rate limited
 /// </summary>
 public class GarminService : IDisposable
 {
+    private readonly GarminSessionStore _sessionStore;
     private GarminConnectContext? _context;
     private GarminConnectClient? _client;
     private HttpClient? _httpClient;
+    private HttpClientHandler? _httpClientHandler;
     private string? _displayName;
-    private string? _cachedEmail;
-    private string? _cachedPasswordHash;
-    private DateTime _lastSuccessfulLogin = DateTime.MinValue;
+    private string? _currentUserKey;
     private DateTime _lastLoginAttempt = DateTime.MinValue;
     private DateTime _rateLimitedUntil = DateTime.MinValue;
     private int _consecutiveFailures = 0;
@@ -32,7 +32,6 @@ public class GarminService : IDisposable
     // Minimum time between login attempts to avoid rate limiting
     private static readonly TimeSpan MinLoginInterval = TimeSpan.FromMinutes(1);
     private static readonly TimeSpan RateLimitCooldown = TimeSpan.FromMinutes(15);
-    private static readonly TimeSpan SessionValidityDuration = TimeSpan.FromHours(1);
     private const int MaxConsecutiveFailures = 3;
 
     public bool IsAuthenticated => _client != null && !string.IsNullOrEmpty(_displayName);
@@ -42,6 +41,11 @@ public class GarminService : IDisposable
 
     // Event for MFA code request
     public event Func<Task<string?>>? OnMfaCodeRequired;
+
+    public GarminService(GarminSessionStore sessionStore)
+    {
+        _sessionStore = sessionStore;
+    }
 
     /// <summary>
     /// Login to Garmin Connect with MFA support and rate-limit protection
@@ -55,38 +59,68 @@ public class GarminService : IDisposable
             return (false, $"Rate-limited by Garmin Connect. Please wait {remaining.Minutes} minutes and {remaining.Seconds} seconds before trying again.");
         }
 
-        // Check if we can reuse existing session (same credentials, session still valid)
+        // Use email as user key for session storage
+        var userKey = ComputeUserKey(email);
+        _currentUserKey = userKey;
+
+        // Try to restore existing session from cache
+        var existingSession = _sessionStore.GetSession(userKey);
         var passwordHash = ComputeSimpleHash(password);
-        if (_client != null && _cachedEmail == email && _cachedPasswordHash == passwordHash)
+
+        if (existingSession != null && existingSession.PasswordHash == passwordHash)
         {
-            // Check if session is likely still valid (within validity window)
-            var sessionAge = DateTime.UtcNow - _lastSuccessfulLogin;
-            if (sessionAge < SessionValidityDuration)
+            // Session exists for this user - try to reuse it
+            try
             {
-                try
+                System.Diagnostics.Debug.WriteLine($"[GarminService] Attempting to restore session for {email}");
+
+                // Recreate HttpClient with existing cookies
+                if (_httpClient == null && existingSession.Cookies != null)
                 {
-                    // Verify existing session is still valid
+                    _httpClientHandler = new HttpClientHandler
+                    {
+                        AllowAutoRedirect = true,
+                        UseCookies = true,
+                        CookieContainer = existingSession.Cookies,
+                        AutomaticDecompression = System.Net.DecompressionMethods.All
+                    };
+
+                    var throttledHandler = new ThrottledHttpMessageHandler(
+                        _httpClientHandler, 
+                        TimeSpan.FromSeconds(3),  // Min delay
+                        TimeSpan.FromSeconds(5)); // Max delay
+                    _httpClient = new HttpClient(throttledHandler);
+                    AddBrowserHeaders(_httpClient);
+                }
+
+                if (_httpClient != null)
+                {
+                    var authParameters = new BasicAuthParameters(email, password);
+                    var mfaCodeProvider = new InteractiveMfaCodeProvider(this);
+
+                    _context = new GarminConnectContext(_httpClient, authParameters, mfaCodeProvider);
+                    _client = new GarminConnectClient(_context);
+
+                    // Verify session is still valid
                     var profile = await _client.GetSocialProfile();
                     if (profile != null)
                     {
                         _displayName = profile.DisplayName;
+                        System.Diagnostics.Debug.WriteLine($"[GarminService] Session restored successfully for {_displayName}");
                         return (true, null);
                     }
                 }
-                catch
-                {
-                    // Session expired, need to re-authenticate
-                    CleanupSession();
-                }
             }
-            else
+            catch (Exception ex)
             {
-                // Session too old, clean up
+                System.Diagnostics.Debug.WriteLine($"[GarminService] Session restoration failed: {ex.Message}");
+                // Session expired, need fresh login
                 CleanupSession();
+                _sessionStore.ClearSession(userKey);
             }
         }
 
-        // Enforce minimum interval between NEW login attempts (not session reuse)
+        // Enforce minimum interval between NEW login attempts
         var timeSinceLastAttempt = DateTime.UtcNow - _lastLoginAttempt;
         if (timeSinceLastAttempt < MinLoginInterval)
         {
@@ -98,31 +132,89 @@ public class GarminService : IDisposable
 
         try
         {
+            System.Diagnostics.Debug.WriteLine($"[GarminService] Starting fresh login for {email} at {DateTime.UtcNow:HH:mm:ss.fff}");
+
             var authParameters = new BasicAuthParameters(email, password);
             var mfaCodeProvider = new InteractiveMfaCodeProvider(this);
 
-            // Reuse HttpClient to maintain connection pooling
-            _httpClient ??= new HttpClient();
+            // Create new HttpClient with throttling
+            if (_httpClient == null)
+            {
+                System.Diagnostics.Debug.WriteLine("[GarminService] Creating new HttpClient with throttling...");
 
+                _httpClientHandler = new HttpClientHandler
+                {
+                    AllowAutoRedirect = true,
+                    UseCookies = true,
+                    AutomaticDecompression = System.Net.DecompressionMethods.All
+                };
+
+                var throttledHandler = new ThrottledHttpMessageHandler(
+                    _httpClientHandler, 
+                    TimeSpan.FromSeconds(3),  // Min delay
+                    TimeSpan.FromSeconds(5)); // Max delay
+                _httpClient = new HttpClient(throttledHandler);
+                AddBrowserHeaders(_httpClient);
+
+                // Initial warm-up delay
+                System.Diagnostics.Debug.WriteLine("[GarminService] Initial warm-up delay...");
+                await Task.Delay(1500);
+            }
+
+            System.Diagnostics.Debug.WriteLine("[GarminService] Creating Garmin Connect context...");
             _context = new GarminConnectContext(_httpClient, authParameters, mfaCodeProvider);
             _client = new GarminConnectClient(_context);
 
-            // Verify authentication by getting user profile
+            System.Diagnostics.Debug.WriteLine("[GarminService] Fetching user profile to verify authentication...");
             var profile = await _client.GetSocialProfile();
             _displayName = profile.DisplayName;
 
-            // Cache credentials for session reuse
-            _cachedEmail = email;
-            _cachedPasswordHash = passwordHash;
+            System.Diagnostics.Debug.WriteLine($"[GarminService] Login successful! User: {_displayName}");
+
+            // Save session to cache for reuse across circuit reconnections
+            var sessionData = new GarminSessionData
+            {
+                Email = email,
+                PasswordHash = passwordHash,
+                DisplayName = _displayName,
+                CreatedAt = DateTime.UtcNow,
+                Cookies = _httpClientHandler?.CookieContainer
+            };
+            _sessionStore.SaveSession(userKey, sessionData);
+
             _consecutiveFailures = 0;
-            _lastSuccessfulLogin = DateTime.UtcNow;
 
             return (true, null);
         }
         catch (Exception ex)
         {
+            System.Diagnostics.Debug.WriteLine($"[GarminService] ❌ Login failed with exception: {ex.GetType().Name}");
+            System.Diagnostics.Debug.WriteLine($"[GarminService] Message: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"[GarminService] StackTrace: {ex.StackTrace}");
+
+            if (ex.InnerException != null)
+            {
+                System.Diagnostics.Debug.WriteLine($"[GarminService] Inner Exception: {ex.InnerException.GetType().Name}");
+                System.Diagnostics.Debug.WriteLine($"[GarminService] Inner Message: {ex.InnerException.Message}");
+                System.Diagnostics.Debug.WriteLine($"[GarminService] Inner StackTrace: {ex.InnerException.StackTrace}");
+            }
+
             CleanupSession();
             _consecutiveFailures++;
+
+            // Check for regex parsing errors (common issue with Garmin.Connect library)
+            bool isRegexError = ex is System.Text.RegularExpressions.RegexMatchTimeoutException ||
+                               ex.Message.Contains("regex", StringComparison.OrdinalIgnoreCase) ||
+                               ex.Message.Contains("pattern", StringComparison.OrdinalIgnoreCase) ||
+                               (ex.InnerException != null && 
+                                (ex.InnerException is System.Text.RegularExpressions.RegexMatchTimeoutException ||
+                                 ex.InnerException.Message.Contains("regex", StringComparison.OrdinalIgnoreCase)));
+
+            if (isRegexError)
+            {
+                System.Diagnostics.Debug.WriteLine($"[GarminService] ⚠️ REGEX ERROR DETECTED - This is a known issue with Garmin's response format");
+                return (false, $"Login failed due to Garmin response parsing error. This usually means Garmin has changed their login page format. Error: {ex.Message}");
+            }
 
             bool isRateLimited = ex.Message.Contains("Rate limited") ||
                                  ex.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ||
@@ -144,7 +236,12 @@ public class GarminService : IDisposable
                 return (false, "Invalid email or password.");
             }
 
-            return (false, ex.Message);
+            // Return detailed error for debugging
+            var errorDetails = ex.InnerException != null 
+                ? $"{ex.Message} (Inner: {ex.InnerException.Message})" 
+                : ex.Message;
+
+            return (false, $"Login failed: {errorDetails}");
         }
     }
 
@@ -156,6 +253,12 @@ public class GarminService : IDisposable
         // Don't dispose HttpClient - it can be reused
     }
 
+    private static string ComputeUserKey(string email)
+    {
+        // Use email hash as cache key
+        return $"user_{ComputeSimpleHash(email)}";
+    }
+
     private static string ComputeSimpleHash(string input)
     {
         // Simple hash for credential comparison (not for security)
@@ -165,6 +268,18 @@ public class GarminService : IDisposable
             hash = ((hash << 5) - hash) + c;
         }
         return hash.ToString("X8");
+    }
+
+    private static void AddBrowserHeaders(HttpClient client)
+    {
+        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
+        client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
+        // NOTE: Do NOT add Accept-Encoding manually - HttpClientHandler.AutomaticDecompression handles this
+        client.DefaultRequestHeaders.Add("DNT", "1");
+        client.DefaultRequestHeaders.Add("Connection", "keep-alive");
+        client.DefaultRequestHeaders.Add("Upgrade-Insecure-Requests", "1");
+        client.Timeout = TimeSpan.FromMinutes(5);
     }
 
     /// <summary>
@@ -184,9 +299,12 @@ public class GarminService : IDisposable
     /// </summary>
     public void Logout()
     {
+        if (_currentUserKey != null)
+        {
+            _sessionStore.ClearSession(_currentUserKey);
+        }
         CleanupSession();
-        _cachedEmail = null;
-        _cachedPasswordHash = null;
+        _currentUserKey = null;
         _consecutiveFailures = 0;
     }
 
@@ -534,6 +652,9 @@ internal class InteractiveMfaCodeProvider : IMfaCodeProvider
 
     public async Task<string> GetMfaCodeAsync()
     {
+        // Add a small delay to make the flow more human-like
+        await Task.Delay(500);
+
         var code = await _service.RequestMfaCodeAsync();
         return code ?? throw new InvalidOperationException("MFA code was not provided");
     }

@@ -8,6 +8,9 @@ builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
 // Register application services
+// Use memory cache to persist Garmin sessions across Blazor circuit reconnections
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<GarminSessionStore>();
 builder.Services.AddScoped<GarminService>();
 builder.Services.AddSingleton<OmronCsvParser>();
 builder.Services.AddScoped<TimezoneService>();
