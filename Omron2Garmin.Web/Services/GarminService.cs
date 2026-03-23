@@ -26,59 +26,43 @@ public class GarminService : IDisposable
     /// </summary>
     public async Task<(bool Success, string? Error)> LoginAsync(string email, string password)
     {
-        const int maxAttempts = 3;
-        int[] retryDelaysMs = [3000, 8000, 15000];
-
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        try
         {
-            try
-            {
-                var authParameters = new BasicAuthParameters(email, password);
-                var mfaCodeProvider = new InteractiveMfaCodeProvider(this);
+            var authParameters = new BasicAuthParameters(email, password);
+            var mfaCodeProvider = new InteractiveMfaCodeProvider(this);
 
-                _context = new GarminConnectContext(new HttpClient(), authParameters, mfaCodeProvider);
-                _client = new GarminConnectClient(_context);
+            _context = new GarminConnectContext(new HttpClient(), authParameters, mfaCodeProvider);
+            _client = new GarminConnectClient(_context);
 
-                // Verify authentication by getting user profile
-                var profile = await _client.GetSocialProfile();
-                _displayName = profile.DisplayName;
+            // Verify authentication by getting user profile
+            var profile = await _client.GetSocialProfile();
+            _displayName = profile.DisplayName;
 
-                return (true, null);
-            }
-            catch (Exception ex)
-            {
-                _context = null;
-                _client = null;
-                _displayName = null;
-
-                bool isRateLimited = ex.Message.Contains("Rate limited") || ex.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase);
-
-                if (isRateLimited && attempt < maxAttempts - 1)
-                {
-                    await Task.Delay(retryDelaysMs[attempt]);
-                    continue;
-                }
-
-                string errorMessage;
-                if (isRateLimited)
-                {
-                    errorMessage = "Garmin Connect is rate-limiting login attempts. Please wait a few minutes before trying again.";
-                }
-                else if (ex.Message.Contains("401") || ex.Message.Contains("Unauthorized"))
-                {
-                    errorMessage = "Invalid email or password";
-                }
-                else
-                {
-                    errorMessage = ex.Message;
-                }
-
-                return (false, errorMessage);
-            }
+            return (true, null);
         }
+        catch (Exception ex)
+        {
+            _context = null;
+            _client = null;
+            _displayName = null;
 
-        // Should not reach here, but satisfy compiler
-        return (false, "Login failed after multiple attempts");
+            bool isRateLimited = ex.Message.Contains("Rate limited") ||
+                                 ex.Message.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ||
+                                 ex.Message.Contains("429", StringComparison.OrdinalIgnoreCase) ||
+                                 ex.Message.Contains("too many", StringComparison.OrdinalIgnoreCase);
+
+            if (isRateLimited)
+            {
+                return (false, "Garmin Connect is rate-limiting login attempts. Please wait 15-30 minutes before trying again.");
+            }
+
+            if (ex.Message.Contains("401") || ex.Message.Contains("Unauthorized"))
+            {
+                return (false, "Invalid email or password.");
+            }
+
+            return (false, ex.Message);
+        }
     }
 
     /// <summary>
